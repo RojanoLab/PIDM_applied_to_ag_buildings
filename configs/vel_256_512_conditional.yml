@@ -1,0 +1,47 @@
+log_dir: "./experiments/rectangular_images"
+
+data:
+    dataset: "kmflow"
+    category: "kmflow"
+    image_size: [512,256]
+    channels: 3
+    num_workers: 4
+    data_dir_gtx: "./data/test_Vel_X.npy"         # Ground truth x-vel NPY file
+    data_dir_gux: "./data/test_Vel_X_guided.npy"  # Guided images g(u)
+    data_dir_gty: "./data/test_Vel_Y.npy"          # Ground truth y-vel NPY file
+    data_dir_ke: "./data/mean_ke.npz"              # Kinetic energy NPZ file
+    data_kw: ''
+    smoothing: True
+    smoothing_scale: 8  # Add this line with a reasonable default value
+    blur_method: "nearest"
+    blur_scale: 1
+
+
+model:
+    type: "conditional"
+    in_channels: 3 #4
+    out_ch: 3 #4
+    ch: 64
+    ch_mult: [ 1, 1, 1, 2 ]
+    num_res_blocks: 1
+    attn_resolutions: [ 16, ]
+    dropout: 0.1
+    var_type: fixedlarge
+    ema_rate: 0.9999
+    ema: True
+    resamp_with_conv: True
+    ckpt_path: "./pretrained_weights/ckpt_Vel_X.pth" 
+
+diffusion:
+    beta_schedule: linear
+    beta_start: 0.0001
+    beta_end: 0.02
+    num_diffusion_timesteps: 1000
+
+sampling:
+    batch_size: 3 #12 # 20 original
+    last_only: True
+    guidance_weight: 3.0
+    dump_arr: True   # Add this line to control whether to save arrays
+    log_loss: True
+

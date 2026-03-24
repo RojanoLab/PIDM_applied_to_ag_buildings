@@ -1,0 +1,51 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs and local env
+*.log
+.env
+.env.*
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project data and generated outputs (usually large)
+data/
+images/
+experiments/
+train_ddpm/experiments/
+train_ddpm/runs/
+runs/
+
+# Model weights / checkpoints
+pretrained_weights/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Numpy / serialized arrays (can get very large)
+*.npy
+*.npz
+
+# Jupyter
+.ipynb_checkpoints/
