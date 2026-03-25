@@ -15,7 +15,7 @@ dist/
 *.egg-info/
 .eggs/
 
-# Logs and local env
+# Logs and local environment files
 *.log
 .env
 .env.*
@@ -28,24 +28,39 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Project data and generated outputs (usually large)
-data/
-images/
-experiments/
-train_ddpm/experiments/
-train_ddpm/runs/
-runs/
-
-# Model weights / checkpoints
-pretrained_weights/
+# Model artifacts
 *.pt
 *.pth
 *.ckpt
 *.onnx
 
-# Numpy / serialized arrays (can get very large)
+# Large array dumps
 *.npy
 *.npz
+
+# Keep required project folders even if empty
+# (Git doesn't track empty folders, so keep .gitkeep files)
+
+data/*
+!data/.gitkeep
+
+images/*
+!images/.gitkeep
+
+experiments/*
+!experiments/.gitkeep
+
+pretrained_weights/*
+!pretrained_weights/.gitkeep
+
+resources/*
+!resources/.gitkeep
+
+train_ddpm/experiments/*
+!train_ddpm/experiments/.gitkeep
+
+train_ddpm/runs/*
+!train_ddpm/runs/.gitkeep
 
 # Jupyter
 .ipynb_checkpoints/

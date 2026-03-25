@@ -1,28 +1,27 @@
 ﻿# Physics-informed Diffusion Model for Turbulent Velocity Field Reconstruction
 
-[![GitHub](https://img.shields.io/badge/GitHub-RojanoLab%2FPIDM-blue?logo=github)](https://github.com/RojanoLab/PIDM)
+[![GitHub](https://img.shields.io/badge/GitHub-RojanoLab%2FPIDM_applied_to_ag_buildings-blue?logo=github)](https://github.com/RojanoLab/PIDM_applied_to_ag_buildings)
 
 PyTorch implementation of
 
-**A Physics-informed Diffusion Model for High-fidelity Flow Field Reconstruction**
+**A Physics-informed Diffusion Model Applied to Agricultural Buildings**.
 
-Applied to turbulent airflow reconstruction around **agricultural buildings**.
 
-> **Repository:** [https://github.com/RojanoLab/PIDM](https://github.com/RojanoLab/PIDM)
 
-(Links to paper: <a href="https://www.sciencedirect.com/science/article/pii/S0021999123000670">Journal of Computational Physics</a> | <a href="https://arxiv.org/abs/2211.14680">arXiv</a>)
+A brief introduction is presented in a [poster](resources/AI_in_agriculture.pdf)
 
 ## Overview
 
-Denoising Diffusion Probabilistic Models (DDPM) are used here to reconstruct high-fidelity 2D turbulent velocity fields (x- and y-components) around agricultural buildings from sparse or low-fidelity references. The model is trained exclusively on high-resolution velocity data and uses a **physics-informed conditioning signal** derived from the k-ε turbulence model to guide the reverse diffusion process. This conditioning enforces RANS residuals (continuity, momentum, and turbulent transport equations) during sampling, making reconstructions physically consistent without requiring paired low/high-resolution training data.
+Denoising Diffusion Probabilistic Models (DDPM) are used here to reconstruct high-fidelity 2D turbulent velocity fields (x- and y-components) for agricultural buildings from sparse or low-fidelity references. The model is trained exclusively on high-resolution velocity data and uses a **physics-informed conditioning signal** derived from the k-ε turbulence model to guide the reverse diffusion process. This conditioning enforces RANS residuals (continuity, momentum, and turbulent transport equations) during sampling, making reconstructions physically consistent from guided images.
 
+![Alt text](resources/image0.png)
 ## Project Structure
 
 ```
-PIDM/
+diffusion_final_github/
 ├── main.py                                      # Entry point for guided sampling / reconstruction
 ├── configs/
-│   └── kmflow_re1000_rs256_conditional.yml      # Sampling configuration
+│   └── vel_256_512_conditional.yml              # Sampling configuration
 ├── train_ddpm/
 │   ├── main.py                                  # Entry point for model training
 │   ├── train.sh                                 # Training shell script
@@ -37,11 +36,14 @@ PIDM/
 │   ├── denoising_step.py                        # DDPM / DDIM denoising steps
 │   └── process_data.py                          # Data loading and pre-processing
 ├── data/
-│   ├── Vel_X.npy                                # X-velocity training data  (7, 144, 256, 512) uint8
-│   ├── Vel_Y.npy                                # Y-velocity training data  (7, 144, 256, 512) uint8
-│   ├── 256-512_Vel_X_stats.npz                  # Normalisation stats for Vel_X (mean, scale)
-│   ├── 256-512_Vel_Y_stats.npz                  # Normalisation stats for Vel_Y (mean, scale)
-│   └── prediction_k_eps_mean.npz               # k-ε turbulence model predictions (k, epsilon)
+│   ├── train_Vel_X.npy                          # X-velocity training data
+│   ├── train_Vel_Y.npy                          # Y-velocity training data
+│   ├── train_256-512_Vel_X_stats.npz            # Normalization stats for train_Vel_X.npy
+│   ├── train_256-512_Vel_Y_stats.npz            # Normalization stats for train_Vel_Y.npy
+│   ├── test_Vel_X.npy                           # X-velocity test/reference data for reconstruction
+│   ├── test_Vel_X_guided.npy                    # Guided signal g(u) for reconstruction
+│   ├── test_Vel_Y.npy                           # Y-velocity test/reference data
+│   └── mean_ke.npz                              # Kinetic energy / turbulence prior input
 ├── pretrained_weights/                          # Saved model checkpoints (.pth)
 └── experiments/                                 # Output directory for reconstructions
 ```
@@ -52,21 +54,24 @@ The training data consists of 2D turbulent velocity fields with the following pr
 
 | File | Shape | dtype | Description |
 |------|-------|-------|-------------|
-| `Vel_X.npy` | `(7, 144, 256, 512)` | uint8 | X-component of velocity (7 sequences × 144 time steps × 256 × 512 px) |
-| `Vel_Y.npy` | `(7, 144, 256, 512)` | uint8 | Y-component of velocity |
-| `256-512_Vel_X_stats.npz` | scalars | float64 | `mean` and `scale` for Vel_X normalisation |
-| `256-512_Vel_Y_stats.npz` | scalars | float64 | `mean` and `scale` for Vel_Y normalisation |
-| `prediction_k_eps_mean.npz` | arrays | float32 | Turbulent kinetic energy `k` and dissipation rate `epsilon` from a RANS k-ε model |
+| `train_Vel_X.npy` | `(N, T, 256, 512)` | uint8/float | X-component training fields |
+| `train_Vel_Y.npy` | `(N, T, 256, 512)` | uint8/float | Y-component training fields |
+| `train_256-512_Vel_X_stats.npz` | scalars | float | `mean` and `scale` for X normalization |
+| `train_256-512_Vel_Y_stats.npz` | scalars | float | `mean` and `scale` for Y normalization |
+| `mean_ke.npz` | arrays | float | Turbulence prior (kinetic energy) used in training/sampling |
+| `test_Vel_X.npy` | `(N, T, 256, 512)` | uint8/float | X-component reference fields for reconstruction |
+| `test_Vel_X_guided.npy` | `(N, T, 256, 512)` | uint8/float | Guided conditioning signal `g(u)` |
+| `test_Vel_Y.npy` | `(N, T, 256, 512)` | uint8/float | Y-component reference fields |
 
-Place all data files inside the `./data/` subdirectory before running any experiment.
+[Download](https://figshare.com/s/5e0ff1c782faef1a7e1a) and unzip all data files to be placed inside the `./data/` subdirectory before running any experiment.
 
-For reconstruction (sampling), three additional reference files are expected at the root:
+For reconstruction (sampling), the default config expects test files under `./data/`:
 
 | File | Description |
 |------|-------------|
-| `ref1.npy` | Ground-truth x-velocity reference (sequence 8) |
-| `ref2.1.npy` | Guided image conditioning signal g(u) |
-| `seq_8_y_npy.npy` | Ground-truth y-velocity reference (sequence 8) |
+| `test_Vel_X.npy` | Ground-truth/reference x-velocity input |
+| `test_Vel_X_guided.npy` | Guided image conditioning signal `g(u)` |
+| `test_Vel_Y.npy` | Ground-truth/reference y-velocity |
 
 ## Environment
 
@@ -96,7 +101,7 @@ or directly:
 python main.py \
     --config ./vel_256_512_conditional.yml \
     --exp ./experiments/results/ \
-    --doc ./weights/trained_UNet_nn_/ \
+  --doc weights/trained_UNet_nn_ \
     --ni
 ```
 
@@ -123,13 +128,13 @@ You can change the output location via the `--exp` and `--doc` arguments.
 
 ### Step 2 — Physics-informed Reconstruction (Sampling)
 
-Place the trained checkpoint (e.g., `ckpt_Vel_X.pth`) into `./pretrained_weights/` and set `ckpt_path` accordingly in `configs/kmflow_re1000_rs256_conditional.yml`.
+Place the trained checkpoint (e.g., `ckpt_Vel_X.pth`) available [here](https://figshare.com/ndownloader/files/63056209?private_link=06434d6d5cfdda10b811) into `./pretrained_weights/` accordingly in `configs/vel_256_512_conditional.yml`.
 
 From the **root** directory of the repository, run:
 
 ```bash
 python main.py \
-    --config kmflow_re1000_rs256_conditional.yml \
+  --config vel_256_512_conditional.yml \
     --seed 1234 \
     --sample_step 1 \
     --t 1000 \
@@ -147,22 +152,10 @@ Key sampling arguments:
 
 The `guidance_weight` in the config controls the strength of the k-ε physics residual signal during sampling. Results are saved under `./experiments/` in a subfolder named after the run parameters (e.g., `guided_recons__t1000_r20_w3.0/`).
 
+
 ## References
 
-If you find this repository useful for your research, please cite the following work.
-
-```bibtex
-@article{shu2023physics,
-  title={A Physics-informed Diffusion Model for High-fidelity Flow Field Reconstruction},
-  author={Shu, Dule and Li, Zijie and Farimani, Amir Barati},
-  journal={Journal of Computational Physics},
-  pages={111972},
-  year={2023},
-  publisher={Elsevier}
-}
-```
-
 This implementation is based on / inspired by:
-
+- [https://github.com/BaratiLab/Diffusion-based-Fluid-Super-resolution](https://github.com/BaratiLab/Diffusion-based-Fluid-Super-resolution)(A Physics-informed Diffusion Model for High-fidelity Flow Field Reconstruction)
 - [https://github.com/ermongroup/SDEdit](https://github.com/ermongroup/SDEdit) (SDEdit: Guided Image Synthesis and Editing with Stochastic Differential Equations)
 - [https://github.com/ermongroup/ddim](https://github.com/ermongroup/ddim) (Denoising Diffusion Implicit Models)
