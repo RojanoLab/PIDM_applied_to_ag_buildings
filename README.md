@@ -10,25 +10,24 @@ PyTorch implementation of
 
 ## Overview
 
-Denoising Diffusion Probabilistic Models (DDPM) are used here to reconstruct high-fidelity 2D turbulent velocity fields (x- and y-components) for agricultural buildings from sparse or low-fidelity references. The model is trained exclusively on high-resolution velocity data and uses a **physics-informed conditioning signal** derived from the k-ε turbulence model to guide the reverse diffusion process. This conditioning enforces RANS residuals (continuity, momentum, and turbulent transport equations) during sampling, making reconstructions physically consistent from guided images.
+Denoising Diffusion Probabilistic Models (DDPM) are used here to reconstruct high-fidelity 2D turbulent velocity fields (x- and y-components) for agricultural buildings from sparse or low-fidelity references. The model is trained exclusively on high-resolution velocity data and uses a **physics-informed conditioning signal** derived from the k-ε turbulence model to guide the reverse diffusion process. This conditioning considers that change of the velocity field between two consecutive timesteps, comprising RANS (continuity, momentum, and turbulent transport equations) during sampling, could be reconstructed and physically consistent from guided images.
 
 ![Alt text](resources/image0.png)
 ## Project Structure
 
-A brief presentation is available in this [poster](resources/AI_in_agriculture.pdf)
 
 ```
 diffusion_final_github/
 ├── main.py                                      # Entry point for guided sampling / reconstruction
 ├── configs/
-│   └── vel_256_512_conditional.yml              # Sampling configuration
+│   └── vel_512_1024_conditional.yml              # Sampling configuration
 ├── train_ddpm/
 │   ├── main.py                                  # Entry point for model training
 │   ├── train.sh                                 # Training shell script
 │   └── configs/
-│       └── vel_256_512_conditional.yml          # Training configuration
+│       └── vel_512_1024_conditional.yml          # Training configuration
 ├── runners/
-│   └── rs256_guided_diffusion2.py               # Guided diffusion sampler with k-ε conditioning
+│   └── rs512_guided_diffusion2.py               # Guided diffusion sampler with k-ε conditioning
 ├── models/
 │   ├── diffusion_new.py                         # UNet (unconditional and conditional variants)
 │   └── ema.py                                   # Exponential Moving Average helper
@@ -38,8 +37,8 @@ diffusion_final_github/
 ├── data/
 │   ├── train_Vel_X.npy                          # X-velocity training data
 │   ├── train_Vel_Y.npy                          # Y-velocity training data
-│   ├── train_256-512_Vel_X_stats.npz            # Normalization stats for train_Vel_X.npy
-│   ├── train_256-512_Vel_Y_stats.npz            # Normalization stats for train_Vel_Y.npy
+│   ├── train_512-1024_Vel_X_stats.npz            # Normalization stats for train_Vel_X.npy
+│   ├── train_512-1024_Vel_Y_stats.npz            # Normalization stats for train_Vel_Y.npy
 │   ├── test_Vel_X.npy                           # X-velocity test/reference data for reconstruction
 │   ├── test_Vel_X_guided.npy                    # Guided signal g(u) for reconstruction
 │   ├── test_Vel_Y.npy                           # Y-velocity test/reference data
@@ -54,14 +53,14 @@ The training data consists of 2D turbulent velocity fields with the following pr
 
 | File | Shape | dtype | Description |
 |------|-------|-------|-------------|
-| `train_Vel_X.npy` | `(N, T, 256, 512)` | uint8/float | X-component training fields |
-| `train_Vel_Y.npy` | `(N, T, 256, 512)` | uint8/float | Y-component training fields |
+| `train_Vel_X.npy` | `(N, T, 512, 1024)` | uint8/float | X-component training fields |
+| `train_Vel_Y.npy` | `(N, T, 512, 1024)` | uint8/float | Y-component training fields |
 | `train_256-512_Vel_X_stats.npz` | scalars | float | `mean` and `scale` for X normalization |
-| `train_256-512_Vel_Y_stats.npz` | scalars | float | `mean` and `scale` for Y normalization |
+| `train_512-1024_Vel_Y_stats.npz` | scalars | float | `mean` and `scale` for Y normalization |
 | `mean_ke.npz` | arrays | float | Turbulence prior (kinetic energy) used in training/sampling |
-| `test_Vel_X.npy` | `(N, T, 256, 512)` | uint8/float | X-component reference fields for reconstruction |
-| `test_Vel_X_guided.npy` | `(N, T, 256, 512)` | uint8/float | Guided conditioning signal `g(u)` |
-| `test_Vel_Y.npy` | `(N, T, 256, 512)` | uint8/float | Y-component reference fields |
+| `test_Vel_X.npy` | `(N, T, 512, 1024)` | uint8/float | X-component reference fields for reconstruction |
+| `test_Vel_X_guided.npy` | `(N, T, 512, 1024)` | uint8/float | Guided conditioning signal `g(u)` |
+| `test_Vel_Y.npy` | `(N, T, 512, 1024)` | uint8/float | Y-component reference fields |
 
 [Download](https://figshare.com/ndownloader/files/63064630) and unzip all data files to be placed inside the `./data/` subdirectory before running any experiment.
 
@@ -99,7 +98,7 @@ or directly:
 
 ```bash
 python main.py \
-    --config ./vel_256_512_conditional.yml \
+    --config ./vel_512_1024_conditional.yml \
     --exp ./experiments/results/ \
   --doc weights/trained_UNet_nn_ \
     --ni
@@ -109,7 +108,7 @@ Key training hyperparameters (set in `train_ddpm/configs/vel_256_512_conditional
 
 | Parameter | Value |
 |-----------|-------|
-| Image size | 512 × 256 |
+| Image size | 1024 × 512 |
 | Channels | 3 |
 | Batch size | 12 |
 | Epochs | 1 000 |
@@ -128,13 +127,13 @@ You can change the output location via the `--exp` and `--doc` arguments.
 
 ### Step 2 — Physics-informed Reconstruction (Sampling)
 
-Place the trained checkpoint (e.g., `ckpt_Vel_X.pth`) available [here](https://figshare.com/ndownloader/files/63056209?private_link=06434d6d5cfdda10b811) into `./pretrained_weights/` accordingly in `configs/vel_256_512_conditional.yml`.
+Place the trained checkpoint (e.g., `ckpt_Vel_X.pth`) available [here](https://figshare.com/ndownloader/files/63056209?private_link=06434d6d5cfdda10b811) into `./pretrained_weights/` accordingly in `configs/vel_512_1024_conditional.yml`.
 
 From the **root** directory of the repository, run:
 
 ```bash
 python main.py \
-  --config vel_256_512_conditional.yml \
+  --config vel_512_1024_conditional.yml \
     --seed 1234 \
     --sample_step 1 \
     --t 1000 \
