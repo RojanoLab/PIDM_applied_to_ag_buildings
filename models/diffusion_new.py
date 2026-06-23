@@ -623,7 +623,7 @@ class ConditionalModel(nn.Module):
 
     def forward(self, x, t, dx=None):
         # assert x.shape[2] == x.shape[3] == self.resolution
-        assert (x.shape[2], x.shape[3]) == (256,512), \
+        assert (x.shape[2], x.shape[3]) == (512,1024), \
        f"Input image shape {(x.shape[2], x.shape[3])} doesn't match expected {self.resolution}"   #EL MODELO ENTIENDE ALTO LUEGO ANCHO, SE INVIERTE A COMO VIENE EN IMAGE2NPY E IMAGE_RESIZER
 
     
