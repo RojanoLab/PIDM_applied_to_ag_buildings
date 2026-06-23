@@ -3,7 +3,7 @@ log_dir: "./experiments/rectangular_images"
 data:
     dataset: "kmflow"
     category: "kmflow"
-    image_size: [512,256]
+    image_size: [1024,512]
     channels: 3
     num_workers: 4
     data_dir_gtx: "./data/test_Vel_X.npy"         # Ground truth x-vel NPY file
