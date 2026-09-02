@@ -12,7 +12,8 @@ PyTorch implementation of
 
 Denoising Diffusion Probabilistic Models (DDPM) are used here to reconstruct high-fidelity 2D turbulent velocity fields (x- and y-components) for agricultural buildings from sparse or low-fidelity references. The model is trained exclusively on high-resolution velocity data and uses a **physics-informed conditioning signal** derived from the k-ε turbulence model to guide the reverse diffusion process. This conditioning considers that change of the velocity field between two consecutive timesteps, comprising RANS (continuity, momentum, and turbulent transport equations) during sampling, could be reconstructed and physically consistent from guided images.
 
-![Alt text](image/image1.png)
+<img width="1171" height="243" alt="image1" src="https://github.com/user-attachments/assets/004ffe72-9477-46aa-b5e1-4a9b73d4874e" />
+
 ## Project Structure
 
 
