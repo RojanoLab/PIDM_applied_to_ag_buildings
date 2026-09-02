@@ -42,7 +42,7 @@ diffusion_final_github/
 │   ├── test_Vel_X.npy                           # X-velocity test/reference data for reconstruction
 │   ├── test_Vel_X_guided.npy                    # Guided signal g(u) for reconstruction
 │   ├── test_Vel_Y.npy                           # Y-velocity test/reference data
-│   └── mean_ke.npz                              # Kinetic energy / turbulence prior input
+│  
 ├── pretrained_weights/                          # Saved model checkpoints (.pth)
 └── experiments/                                 # Output directory for reconstructions
 ```
@@ -55,7 +55,7 @@ The training data consists of 2D turbulent velocity fields with the following pr
 |------|-------|-------|-------------|
 | `train_Vel_X.npy` | `(N, T, 512, 1024)` | uint8/float | X-component training fields |
 | `train_Vel_Y.npy` | `(N, T, 512, 1024)` | uint8/float | Y-component training fields |
-| `train_256-512_Vel_X_stats.npz` | scalars | float | `mean` and `scale` for X normalization |
+| `train_512-1024_Vel_X_stats.npz` | scalars | float | `mean` and `scale` for X normalization |
 | `train_512-1024_Vel_Y_stats.npz` | scalars | float | `mean` and `scale` for Y normalization |
 | `mean_ke.npz` | arrays | float | Turbulence prior (kinetic energy) used in training/sampling |
 | `test_Vel_X.npy` | `(N, T, 512, 1024)` | uint8/float | X-component reference fields for reconstruction |
