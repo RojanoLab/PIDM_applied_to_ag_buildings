@@ -6,6 +6,7 @@ import torch
 import torchvision.utils as tvu
 import torch.nn.functional as F
 import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, TensorDataset
 
 from models.diffusion_new import ConditionalModel as CModel
 from models.diffusion_new import Model
@@ -14,11 +15,111 @@ from functions.denoising_step import guided_ddpm_steps, guided_ddim_steps, ddpm_
 from einops import rearrange
 import pickle
 from torch.optim.sgd import SGD
+import sys
+import os
+# Add train_ddpm to path for imports
+train_ddpm_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../train_ddpm'))
+sys.path.insert(0, train_ddpm_path)
+# Import directly from the losses.py file
+import importlib.util
+spec = importlib.util.spec_from_file_location("losses", os.path.join(train_ddpm_path, "functions/losses.py"))
+losses_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(losses_module)
+get_safe_fluid_mask = losses_module.get_safe_fluid_mask
+compute_5point_divergence = losses_module.compute_5point_divergence
+
+# Override velocity_residual with a version that handles detach correctly for inference
+def velocity_residual(w: torch.Tensor, 
+                      w2: torch.Tensor, 
+                      safe_mask: torch.Tensor, 
+                      dx_spacing: float = 0.0358203125, 
+                      dy_spacing: float = 0.0358203125, 
+                      calc_grad: bool = False):
+    """
+    Inference version of velocity_residual with proper detach handling.
+    """
+    # Detach first to break computation graph, then clone and set requires_grad
+    w = w.detach().clone().requires_grad_(True)
+    w2 = w2.detach().clone().requires_grad_(True)
+
+    # 1. Compute raw 5-point spatial divergence
+    vel_res = compute_5point_divergence(w, w2, dx=dx_spacing, dy=dy_spacing)
+    masked_res = vel_res * safe_mask
+
+    residual_loss = torch.nan_to_num((masked_res**2).mean(), nan=1e6, posinf=1e6, neginf=1e6)
+
+    if not calc_grad:
+        return residual_loss
+   
+    grads = torch.autograd.grad(residual_loss, [w, w2], create_graph=False, retain_graph=False)
+    wr_u, wr_v = grads[0], grads[1]
+
+    dx = torch.cat([wr_u, wr_v], dim=1)
+    
+    return residual_loss, dx
 ################ Some definitions as part of the Physics Informed Condition ##################################
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_KE_EPS_PATH = os.path.join(_REPO_ROOT, "data", "prediction_k_eps_mean.npz")
-_KE_EPS_CACHE = {}
+
+
+def _resolve_num_workers(requested_workers):
+    if os.name == "nt" and requested_workers > 0:
+        return 0
+    return requested_workers
+
+def _model_in_channels(model) -> int:
+    if hasattr(model, "module") and hasattr(model.module, "in_channels"):
+        return int(model.module.in_channels)
+    if hasattr(model, "in_channels"):
+        return int(model.in_channels)
+    raise AttributeError("Model does not expose in_channels")
+
+
+def _converted_to_physical_linear_params(data_mean, data_scale,
+                                         physical_min: float, physical_max: float,
+                                         pix_max: float, pix_min: float):
+    if pix_max <= pix_min:
+        raise ValueError(f"Invalid pixel bounds: pix_max={pix_max}, pix_min={pix_min}")
+
+    data_mean = float(data_mean)
+    data_scale = float(data_scale)
+    gain = (physical_max - physical_min) / (pix_max - pix_min)
+
+    scale = data_scale * gain
+    offset = (data_mean - pix_min) * gain + physical_min
+    return offset, scale
+
+
+def _pixel_to_physical(x, pix_min: float, pix_max: float, physical_min: float, physical_max: float):
+    if pix_max <= pix_min:
+        raise ValueError(f"Invalid pixel bounds: pix_max={pix_max}, pix_min={pix_min}")
+    x = x.to(torch.float32)
+    return (x - pix_min) / (pix_max - pix_min) * (physical_max - physical_min) + physical_min
+
+
+def _is_state_dict_like(obj):
+    if not isinstance(obj, dict) or not obj:
+        return False
+    sample_value = next(iter(obj.values()))
+    return torch.is_tensor(sample_value)
+
+
+def _extract_model_state_dict(ckpt_obj, prefer_ema=False):
+    if _is_state_dict_like(ckpt_obj):
+        return ckpt_obj
+
+    if isinstance(ckpt_obj, dict):
+        for key in ("state_dict", "model", "model_state_dict"):
+            if key in ckpt_obj and _is_state_dict_like(ckpt_obj[key]):
+                return ckpt_obj[key]
+
+    if isinstance(ckpt_obj, (list, tuple)):
+        if prefer_ema and len(ckpt_obj) >= 5 and _is_state_dict_like(ckpt_obj[4]):
+            return ckpt_obj[4]
+        for item in ckpt_obj:
+            if _is_state_dict_like(item):
+                return item
+
+    raise ValueError("Could not find a model state dict inside checkpoint")
 
 def _get_ke_init_tensors(target_device):
     cache_key = str(target_device)
@@ -35,87 +136,6 @@ def _get_ke_init_tensors(target_device):
     return _KE_EPS_CACHE[cache_key]
 
 
-def _coerce_ke_tensors(ke_tensor, target_device):
-    if ke_tensor is None:
-        return None
-
-    if isinstance(ke_tensor, dict):
-        k_src = ke_tensor["k"]
-        eps_src = ke_tensor["epsilon"]
-    elif isinstance(ke_tensor, (tuple, list)) and len(ke_tensor) >= 2:
-        k_src, eps_src = ke_tensor[0], ke_tensor[1]
-    else:
-        return None
-
-    k = torch.as_tensor(k_src, dtype=torch.float32, device=target_device).detach()
-    eps = torch.as_tensor(eps_src, dtype=torch.float32, device=target_device).detach()
-    k = torch.clamp(k, min=1e-8)
-    eps = torch.clamp(eps, min=1e-8)
-    return k, eps
-
-# (convert_to_physical, solve_poisson_iterative, precompute_static_derivatives, compute_residuals_jit)
-@torch.jit.script
-def convert_to_physical(img_float, physical_min: float, physical_max: float, pix_max: float, pix_min: float):
-    img_clamped = torch.clamp(img_float, min=pix_min, max=pix_max)
-    normalized_img = (img_clamped - pix_min) / (pix_max - pix_min)
-    return normalized_img * (physical_max - physical_min) + physical_min
-
-@torch.jit.script
-def solve_poisson_iterative(source_term, p_init, dx: float, dy: float, iterations: int):
-    p = p_init.clone()
-    ax = dy / dx
-    ay = dx / dy
-    ap = -2 * (ax + ay)
-    const = source_term * dx * dy
-    
-    for _ in range(iterations):
-        p_E = torch.roll(p, -1, 1); p_W = torch.roll(p, 1, 1)
-        p_N = torch.roll(p, -1, 0); p_S = torch.roll(p, 1, 0)
-        p = (ax * (p_E + p_W) + ay * (p_N + p_S) - const) / -ap
-        # BCs
-        p[:, 0] = p[:, 1]; p[:, -1] = 0.0
-        p[0, :] = p[1, :]; p[-1, :] = p[-2, :]
-    return p
-
-@torch.jit.script
-def precompute_static_derivatives(u, v, dx: float, dy: float):
-    u_E = torch.roll(u, -1, 1); u_W = torch.roll(u, 1, 1)
-    u_N = torch.roll(u, -1, 0); u_S = torch.roll(u, 1, 0)
-    v_E = torch.roll(v, -1, 1); v_W = torch.roll(v, 1, 1)
-    v_N = torch.roll(v, -1, 0); v_S = torch.roll(v, 1, 0)
-
-    du_dx = (u_E - u_W) / (2 * dx); dv_dy = (v_N - v_S) / (2 * dy)
-    du_dy = (u_N - u_S) / (2 * dy); dv_dx = (v_E - v_W) / (2 * dx)
-
-    S2_static = 2*(du_dx**2) + 2*(dv_dy**2) + (du_dy + dv_dx)**2
-    return S2_static, du_dx, du_dy, dv_dx, dv_dy, u_E, u_W, u_N, u_S
-
-@torch.jit.script
-def compute_residuals_jit( k_val, eps_val, alpha_val, u, v, S2_static, dp_dx_static, adv_term_u_static, dx: float, dy: float, rho: float, nu: float):
-    k = k_val
-    eps = eps_val
-    alpha = 4.0 * torch.sigmoid(alpha_val) - 2.0
-
-    C_mu = 0.09
-    nu_t = C_mu * (k**2) / (eps + 1e-10)
-    effective_nu = nu + nu_t 
-
-    # Momentum Residual
-    u_E = torch.roll(u, -1, 1); u_W = torch.roll(u, 1, 1)
-    u_N = torch.roll(u, -1, 0); u_S = torch.roll(u, 1, 0)
-    
-    eff_nu_e = (effective_nu + torch.roll(effective_nu, -1, 1)) / 2
-    eff_nu_w = (effective_nu + torch.roll(effective_nu, 1, 1)) / 2
-    eff_nu_n = (effective_nu + torch.roll(effective_nu, -1, 0)) / 2
-    eff_nu_s = (effective_nu + torch.roll(effective_nu, 1, 0)) / 2
-    
-    diff_term_u = ((rho * eff_nu_e * (u_E - u) / dx) - (rho * eff_nu_w * (u - u_W) / dx)) / dx + \
-                  ((rho * eff_nu_n * (u_N - u) / dy) - (rho * eff_nu_s * (u - u_S) / dy)) / dy
-    
-    res_mom = ( adv_term_u_static) + ((1 - alpha)* dp_dx_static) - diff_term_u
-    
-    res = res_mom / rho
-    return torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
 ################ End of Some definitions as part of the Physics Informed Condition ##################################
 
 class MetricLogger(object):
@@ -131,7 +151,8 @@ class MetricLogger(object):
     @torch.no_grad()
     def update(self, **kwargs):
         for key in self.metric_fn_dict.keys():
-            self.metric_dict[key].append(self.metric_fn_dict[key](**kwargs))
+            with torch.enable_grad():
+                self.metric_dict[key].append(self.metric_fn_dict[key](**kwargs))
 
     def get(self):
         return self.metric_dict.copy()
@@ -140,161 +161,39 @@ class MetricLogger(object):
         with open(os.path.join(outdir, f'metric_log_{postfix}.pkl'), 'wb') as f:
             pickle.dump(self.metric_dict, f)
 
-def normalize_to_01(image_array):#Scales a NumPy array to the range [0, 1]
-    min_val = -7
-    max_val = 17
-    if max_val - min_val > 0:
-        return (image_array - min_val) / 24
-    else:
-        return torch.zeros(image_array.shape)
-    
-################ Main code for the Physics Informed Condition #########################
-def main_code(w, w2, ke_tensor=None):
-    local_device = w.device
-    w = w.clone()
-    w.requires_grad_(True)
-    w2 = w2.clone()
-    w2.requires_grad_(True)
-    wr = w.clone()
-    wr.requires_grad_(True)
-
-    # Physics Parameters
-    params = {"dx": 0.071640625, "nu": 1.46e-5, "rho": 1.225, "mu": 1.78e-5}
-    OPTIM_STEPS = 100  ###it is small because the value is close to the optimal one
-
-    u_phys = convert_to_physical(w, -7.0, 17.0, 246.0, 0)
-    v_phys = convert_to_physical(w2, -5.0, 9.0, 244.0, 0)
-
-    # Use detached tensors inside the inner optimizer loop to avoid
-    u_phys_opt = u_phys.detach()
-    v_phys_opt = v_phys.detach()
-    
-    # 3. Precompute Static Fields
-    dx, dy = params["dx"], params["dx"]
-    rho, mu = params["rho"], params["mu"]
-    
-    S2_static, du_dx, du_dy, dv_dx, dv_dy, u_E, u_W, u_N, u_S = precompute_static_derivatives(u_phys, v_phys, dx, dy)
-    
-    d2u_dx2 = (u_E - 2*u_phys + u_W)/dx**2; d2u_dy2 = (u_N - 2*u_phys + u_S)/dy**2
-    d2v_dx2 = (torch.roll(v_phys,-1,1) - 2*v_phys + torch.roll(v_phys,1,1))/dx**2 
-    d2v_dy2 = (torch.roll(v_phys,-1,0) - 2*v_phys + torch.roll(v_phys,1,0))/dy**2
-    
-    Fx = rho*(u_phys*du_dx + v_phys*du_dy) - mu*(d2u_dx2 + d2u_dy2)
-    Fy = rho*(u_phys*dv_dx + v_phys*dv_dy) - mu*(d2v_dx2 + d2v_dy2)
-    
-    div_F = (torch.roll(Fx,-1,1)-torch.roll(Fx,1,1))/(2*dx) + (torch.roll(Fy,-1,0)-torch.roll(Fy,1,0))/(2*dy)
-    source_term = -div_F
-    
-    p_init = torch.zeros_like(source_term)
-    p_field = solve_poisson_iterative(source_term, p_init, dx, dy, 50)
-    dp_dx_static = (torch.roll(p_field,-1,1) - torch.roll(p_field,1,1)) / (2*dx)
-
-    mask_u = (u_phys > 0).float()
-    du_dx_up = mask_u * (u_phys - u_W)/dx + (1 - mask_u) * (u_E - u_phys)/dx
-    mask_v = (v_phys > 0).float()
-    du_dy_up = mask_v * (u_phys - u_S)/dy + (1 - mask_v) * (u_N - u_phys)/dy
-    adv_term_u_static = (u_phys * du_dx_up + v_phys * du_dy_up)
-    # Load once per process and reuse for all subsequent calls, unless external tensors are provided.
-    ke_pair = _coerce_ke_tensors(ke_tensor, local_device)
-    if ke_pair is None:
-        k, eps = _get_ke_init_tensors(local_device)
-    else:
-        k, eps = ke_pair
-    # Convert arrays to tensors for JIT function inputs.
-    # Initialize Learnable Parameters based on the trained values from the surrogate model. We use a sigmoid transformation to ensure alpha stays within a reasonable range during optimization.
-    alpha = torch.tensor([-0.7569], device=local_device, requires_grad=True)
-    optimizer = SGD([alpha], lr=0.05)
-    
-    # Scaling factors for loss
-    U_scale = torch.sqrt(u_phys_opt**2 + v_phys_opt**2) + 1e-10
-    L_scale = params["dx"] * u_phys.shape[1]
-    scale_mom = (U_scale**2/L_scale)
-    res_acc_mom = torch.zeros_like(u_phys)
-    S2_static_opt = S2_static.detach()
-    dp_dx_static_opt = dp_dx_static.detach()
-    adv_term_u_static_opt = adv_term_u_static.detach()
-
-    # Run Optimization
-    for epoch in range(OPTIM_STEPS):
-        optimizer.zero_grad()
-        res_acc_mom = compute_residuals_jit(
-            k, eps, alpha, u_phys_opt, v_phys_opt, S2_static_opt,
-            dp_dx_static_opt, adv_term_u_static_opt, dx, dy, rho, params["nu"]
-        )
-    
-        # Loss Calculation
-        total_loss = torch.mean(((res_acc_mom) / scale_mom)**2)
-        loss_alpha_reg = 0.00001 * (alpha ** 2).mean()
-        total_loss = total_loss + loss_alpha_reg
-        total_loss.backward()
-        optimizer.step()
-        
-    # Recompute residual on the original graph once, using optimized coefficients.
-    res_acc_mom = compute_residuals_jit(
-        k.detach(), eps.detach(), alpha.detach(), u_phys, v_phys, S2_static,
-        dp_dx_static, adv_term_u_static, dx, dy, rho, params["nu"]
-    )
-    dt_char = params["dx"] / (torch.max(torch.sqrt(u_phys**2 + v_phys**2)) + 1e-10)
-    vel_res = res_acc_mom * dt_char
-    vel_res_u=normalize_to_01(vel_res)
-    return vel_res_u
-
-############################### Retrieving and Incorporating Physics Informed Conditions ##############################
-def velocity_residual(w, w2, calc_grad=True, ke_tensor=None):
-    if w.ndim == 3:  
-        w = w.unsqueeze(0)
-    if w2.ndim == 3:   
-        w2 = w2.unsqueeze(0)
-    # Detect the device of the generated image (w).
-    device = w.device 
-    w2 = w2.to(device)
-    if ke_tensor is not None:
-        ke_tensor = _coerce_ke_tensors(ke_tensor, device)
-    w = w.clone().requires_grad_(True)
-    w2 = w2.clone().requires_grad_(True)
-
-    with torch.enable_grad():
-        residual = main_code(w, w2, ke_tensor=ke_tensor)
-    residual_loss = (residual**2).mean()
-
-    if calc_grad:
-        dw = torch.autograd.grad(residual_loss, w, retain_graph=True)[0]
-        return dw, residual_loss
-    else:
-        return residual_loss
-####################### End of the Physics Informed Conditions ########################################################
-
-def load_recons_data(ref_path_gtx, ref_data_gux_path, ref_data_gty_path, ref_data_ke_path, smoothing, smoothing_scale):
+def load_recons_data(ref_path_gtx, ref_data_gux_path, ref_data_gty_path, ref_data_guy_path,
+                     stat_path_x, stat_path_y, smoothing, smoothing_scale):
     
     ref_data_gtx = np.load(ref_path_gtx).astype(np.float32)  # X VELOCITIES (GT), NPY. 
-    data_mean = np.mean(ref_data_gtx[0:])
-    data_scale = np.std(ref_data_gtx[0:])  #It is set to 0 because we only have one sample. [1,144,256,512]
+    with np.load(stat_path_x) as stats_x:
+        data_mean = float(stats_x['mean'])
+        data_scale = float(stats_x['scale'])
     
     ref_data_gtx = ref_data_gtx[-4:, ...].copy().astype(np.float32)   
     ref_data_gtx = torch.as_tensor(ref_data_gtx, dtype=torch.float32)
     
     ref_data_gux = np.load(ref_data_gux_path).astype(np.float32)
     ref_data_gty = np.load(ref_data_gty_path).astype(np.float32)
-    ref_data_ke_raw = np.load(ref_data_ke_path)
-    if hasattr(ref_data_ke_raw, "files") and "k" in ref_data_ke_raw.files and "epsilon" in ref_data_ke_raw.files:
-        ref_data_ke = {
-            "k": ref_data_ke_raw["k"].astype(np.float32),
-            "epsilon": ref_data_ke_raw["epsilon"].astype(np.float32),
-        }
-        ref_data_ke_raw.close()
-    else:
-        ref_data_ke = np.asarray(ref_data_ke_raw, dtype=np.float32)
+    ref_data_guy = np.load(ref_data_guy_path).astype(np.float32)  # Y GUIDANCE
+    
+    with np.load(stat_path_y) as stats_y:
+        data_mean_y = float(stats_y['mean'])
+        data_scale_y = float(stats_y['scale'])
 
     ref_data_gux = ref_data_gux[-4:, ...].copy().astype(np.float32)   
     ref_data_gux = torch.as_tensor(ref_data_gux, dtype=torch.float32)
 
     ref_data_gty = ref_data_gty[-4:, ...].copy().astype(np.float32)    
     ref_data_gty = torch.as_tensor(ref_data_gty, dtype=torch.float32)
+    
+    ref_data_guy = ref_data_guy[-4:, ...].copy().astype(np.float32)
+    ref_data_guy = torch.as_tensor(ref_data_guy, dtype=torch.float32)
 
     
     flattened_ref_data_gux = []
     flattened_ref_data_gtx = []
     flattened_ref_data_gty = []
+    flattened_ref_data_guy = []
     
     for i in range(ref_data_gtx.shape[0]):
         
@@ -302,12 +201,24 @@ def load_recons_data(ref_path_gtx, ref_data_gux_path, ref_data_gty_path, ref_dat
             
             flattened_ref_data_gtx.append(ref_data_gtx[i, j:j + 3, ...])
             flattened_ref_data_gux.append(ref_data_gux[i, j:j + 3, ...])
-            flattened_ref_data_gty.append(ref_data_gty[i, j:j + 3, ...])    
+            flattened_ref_data_gty.append(ref_data_gty[i, j:j + 3, ...])
+            flattened_ref_data_guy.append(ref_data_guy[i, j:j + 3, ...])    
                 
     flattened_ref_data_gtx = torch.stack(flattened_ref_data_gtx, dim=0)
     flattened_ref_data_gux = torch.stack(flattened_ref_data_gux, dim=0)
     flattened_ref_data_gty = torch.stack(flattened_ref_data_gty, dim=0)
-    return flattened_ref_data_gtx, flattened_ref_data_gux, flattened_ref_data_gty, ref_data_ke, data_mean.item(), data_scale.item() 
+    flattened_ref_data_guy = torch.stack(flattened_ref_data_guy, dim=0)
+    
+    return (
+        flattened_ref_data_gtx,
+        flattened_ref_data_gux,
+        flattened_ref_data_gty,
+        flattened_ref_data_guy,
+        data_mean,
+        data_scale,
+        data_mean_y,
+        data_scale_y,
+    )
 
 class MinMaxScaler(object):
     def __init__(self, min, max):
@@ -412,7 +323,12 @@ class Diffusion(object):
             print('Using unconditional model')
             model = Model(self.config)
 
-        model.load_state_dict(torch.load(self.config.model.ckpt_path)[-1])
+        ckpt = torch.load(self.config.model.ckpt_path, map_location=self.device)
+        model_state_dict = _extract_model_state_dict(
+            ckpt,
+            prefer_ema=getattr(self.config.model, "ema", False),
+        )
+        model.load_state_dict(model_state_dict)
 
         model.to(self.device)
 
@@ -420,29 +336,57 @@ class Diffusion(object):
 
         model.eval()
         self.log('Preparing data')
-        ref_data, blur_data, ref_data3, ref_data_ke, data_mean, data_std = load_recons_data(self.config.data.data_dir_gtx, self.config.data.data_dir_gux, self.config.data.data_dir_gty, self.config.data.data_dir_ke, smoothing=self.config.data.smoothing,smoothing_scale=self.config.data.smoothing_scale)
+        ref_data, blur_data, ref_data3, blur_data_y, data_mean, data_std, data_mean_y, data_std_y = load_recons_data(
+            self.config.data.data_dir_gtx,
+            self.config.data.data_dir_gux,
+            self.config.data.data_dir_gty,
+            self.config.data.data_dir_guy,
+            self.config.data.stat_path,
+            self.config.data.stat_pathy,
+            smoothing=self.config.data.smoothing,
+            smoothing_scale=self.config.data.smoothing_scale,
+        )
         
         scaler = StdScaler(data_mean, data_std)
+        y_scaler = StdScaler(data_mean_y, data_std_y)
+        x_offset, x_scale = _converted_to_physical_linear_params(
+            data_mean,
+            data_std,
+            physical_min=-7.0,
+            physical_max=17.0,
+            pix_max=246.0,
+            pix_min=0.0,
+        )
+        y_offset, y_scale = _converted_to_physical_linear_params(
+            data_mean_y,
+            data_std_y,
+            physical_min=-5.0,
+            physical_max=9.0,
+            pix_max=254.0,
+            pix_min=0.0,
+        )
+        num_workers = _resolve_num_workers(self.config.data.num_workers)
 
         self.log("Start sampling")
 
-        testset = torch.utils.data.TensorDataset(ref_data,blur_data,ref_data3)
+        testset = TensorDataset(ref_data, blur_data, ref_data3, blur_data_y)
         
-        test_loader = torch.utils.data.DataLoader(testset,
-                                                  batch_size=self.config.sampling.batch_size,
-                                                  shuffle=False, num_workers=self.config.data.num_workers)
+        test_loader = DataLoader(testset,
+                     batch_size=self.config.sampling.batch_size,
+                     shuffle=False, num_workers=num_workers)
         
-        for batch_index,(data, blur_data, ref_data3) in enumerate(test_loader):
+        for batch_index,(data, blur_data, ref_data3, blur_data_y) in enumerate(test_loader):
             print(batch_index)
             self.log('Batch: {} / Total batch {}'.format(batch_index, len(test_loader)))
             
             x0 = blur_data.to(self.device)
-            y0=ref_data3.to(self.device)
+            y0 = blur_data_y.to(self.device)  # Using guidance Y
             gt = data.to(self.device)
 
-            x0 = x0.squeeze(0)  # Removes the first dimension (size 1)
-            gt = gt.squeeze(0)  # Removes the first dimension (size 1)
-            y0 = y0.squeeze(0) 
+            x0_z = scaler(x0)
+            y0_z = y_scaler(y0)
+            x0_state = torch.cat([x0_z, y0_z], dim=1)
+
 
             self.log('Preparing reference image')
             self.log('Dumping visualization...')
@@ -450,86 +394,165 @@ class Diffusion(object):
             sample_folder = 'sample_batch{}'.format(batch_index)
             ensure_dir(os.path.join(self.image_sample_dir, sample_folder))
 
-            gt_residual = velocity_residual(gt, y0, calc_grad=True, ke_tensor=ref_data_ke)[1].detach()
-            self.log('Residual reference: {}'.format(gt_residual.item()))
-            init_residual = velocity_residual(x0, y0, calc_grad=True, ke_tensor=ref_data_ke)[1].detach()
-            self.log('Residual init: {}'.format(init_residual.item()))
+            model_in_ch = _model_in_channels(model)
+            # Model expects concatenated [x, y] channels: 6 total (3 for X + 3 for Y)
+            expected_channels = 6
+            if model_in_ch != expected_channels:
+                raise ValueError(
+                    f"This runner expects model.in_channels == {expected_channels} (3 X + 3 Y), "
+                    f"but got {model_in_ch}."
+                )
+
+            # Build the safety mask in the same physical space used by the
+            # divergence residual. Using raw pixel values here makes the threshold
+            # almost always active and washes out the real wall boundary.
+            y0_phys = _pixel_to_physical(y0, 0.0, 254.0, -5.0, 9.0)
+            gt_phys = _pixel_to_physical(gt, 0.0, 246.0, -7.0, 17.0)
+            safe_mask = get_safe_fluid_mask(gt_phys, y0_phys, threshold=1e-3).to(self.device)
+
+            gt_residual_loss, _ = velocity_residual(gt_phys, y0_phys, safe_mask, calc_grad=True)
+            gt_residual_loss = gt_residual_loss.detach()
+            self.log('Residual reference: {}'.format(gt_residual_loss.item()))
+            init_phys = _pixel_to_physical(x0, 0.0, 246.0, -7.0, 17.0)
+            init_residual_loss, _ = velocity_residual(init_phys, y0_phys, safe_mask, calc_grad=True)
+            init_residual_loss = init_residual_loss.detach()
+            self.log('Residual init: {}'.format(init_residual_loss.item()))
             
-            x0 = scaler(x0)
+            x0 = x0_z.clone()
             check_valid_image(x0, "Scaled x0")
-        
-            xinit = x0.clone()
+
+            xinit = x0_state.clone()
             
-            # prepare loss function
+            # prepare optional loss logger
+            logger = None
             if self.config.sampling.log_loss:
-                l2_loss_fn = lambda x: l2_loss(scaler.inverse(x).to(gt.device), gt)
-               
-                equation_loss_fn = lambda x: velocity_residual(scaler.inverse(x), y0, calc_grad=False, ke_tensor=ref_data_ke)
+                l2_loss_fn = lambda x: l2_loss(scaler.inverse(x[:, :3]).to(gt.device), gt)
+
+                equation_loss_fn = lambda x: velocity_residual(
+                    x[:, :3] * x_scale + x_offset,
+                    y0_phys,
+                    safe_mask,
+                    calc_grad=True,
+                )[0]  
 
                 logger = MetricLogger({
                     'l2 loss': l2_loss_fn,
                     'residual loss': equation_loss_fn
                 })
-                # we repeat the sampling for multiple times
-                for repeat in range(self.args.repeat_run):
-                    self.log(f'=== Run No.{repeat} ===')
-                                    
+
+            for repeat in range(self.args.repeat_run):
+                self.log(f'=== Run No.{repeat} ===')
+
+                if repeat == 0:
                     x0 = xinit.clone()
-                    for it in range(self.args.sample_step):  # we run the sampling for multiple steps
-                        if it == 0:
+                else:
+                    self.log(f'Refining the result from repeat {repeat - 1}.')
+
+                for it in range(self.args.sample_step):  
+                    if it == 0:
+
+                        self.log(f'--- Iteration {it} of Run No.{repeat} ---')
+                        e = torch.randn_like(x0)
+                        noise_decay = 0.5 ** repeat
+                        total_noise_levels = max(
+                            1,
+                            int(self.args.t * noise_decay * (1 ** it)),
+                        )
+                        self.log(
+                            f'Repeat {repeat}: using {total_noise_levels} noise levels.'
+                        )
+                        a = (1 - self.betas).cumprod(dim=0)
+                        x = x0 * a[total_noise_levels - 1].sqrt() + e * (1.0 - a[total_noise_levels - 1]).sqrt()
+
+                        def physical_gradient_func(x_state):
+                            x_u = x_state[:, :3]
+                            x_v = x_state[:, 3:6]
+                            dx_raw = velocity_residual(
+                                x_u * x_scale + x_offset,
+                                x_v * y_scale + y_offset,
+                                safe_mask,
+                                calc_grad=True,
+                            )[1]
+                            dx_scaled = torch.cat([
+                                dx_raw[:, 0:3] / x_scale,
+                                dx_raw[:, 3:6] / y_scale,
+                            ], dim=1)
+                            return dx_raw, dx_scaled
+
+                        use_physical_guidance = getattr(
+                            self.config.sampling, 'use_physical_guidance', True
+                        )
+                        if self.config.model.type == 'conditional' and use_physical_guidance:
+                            self.log('Using conditional model with vorticity residual gradient guidance.')
+
+                        num_of_reverse_steps = int(self.args.reverse_steps * (1 ** it))
+                        betas = self.betas.to(self.device)
+                        skip = total_noise_levels // num_of_reverse_steps
+                        seq = range(0, total_noise_levels, skip)
+                  
+                        if self.config.model.type == 'conditional' and use_physical_guidance:
+                            self.log('Performing guided DDIM steps with conditional model...')
+                            # Calculate dx (gradients) for this initial state
+                            dx = velocity_residual(
+                                x[:, :3] * x_scale + x_offset,
+                                x[:, 3:6] * y_scale + y_offset,
+                                safe_mask,
+                                calc_grad=True,
+                            )[1]
+                            xs, _ = guided_ddim_steps(x, seq, model, betas,
+                                                    w=self.config.sampling.guidance_weight,
+                                                    w_min=getattr(self.config.sampling, 'guidance_weight_min', self.config.sampling.guidance_weight),
+                                                    dx_scale=getattr(self.config.sampling, 'dx_scale', 1.0),
+                                                    dx_func=physical_gradient_func,
+                                                    dx=dx,
+                                                    input_fn=lambda state: state,
+                                                    cache=False, logger=logger)
+                        elif self.config.model.type == 'conditional':
                             
-                            self.log(f'--- Iteration {it} of Run No.{repeat} ---')                           
-                            e = torch.randn_like(x0)
-                            total_noise_levels = int(self.args.t * (1** it))
-                            a = (1 - self.betas).cumprod(dim=0)
-                            x = x0 * a[total_noise_levels - 1].sqrt() + e * (1.0 - a[total_noise_levels - 1]).sqrt()
-
-                            # Default no-op gradient for non-conditional paths.
-                            physical_gradient_func = lambda x: torch.zeros_like(x)
-                                                                
-                            # Setting up the physical gradient function
-                            if self.config.model.type == 'conditional':
-                                self.log('Using conditional model with vorticity residual gradient guidance.')
-                               
-                                physical_gradient_func = lambda x: velocity_residual(scaler.inverse(x), y0, calc_grad=True, ke_tensor=ref_data_ke)[0] / scaler.scale()
-
-                            num_of_reverse_steps = int(self.args.reverse_steps * (1 ** it))                
-                            betas = self.betas.to(self.device)
-                            skip = total_noise_levels // num_of_reverse_steps
-                            seq = range(0, total_noise_levels, skip)      
-                            # Performing guided diffusion sampling
-                            if self.config.model.type == 'conditional':
-                                self.log('Performing guided DDIM steps with conditional model...')
-                                xs, _ = guided_ddim_steps(x, seq, model, betas,
-                                                        w=self.config.sampling.guidance_weight,
-                                                        dx_func=physical_gradient_func, cache=False, logger=logger)
-                            elif self.config.sampling.lambda_ > 0:
-                                self.log('Performing guided DDIM steps with lambda > 0...')
-                                xs, _ = ddim_steps(x, seq, model, betas,
-                                                dx_func=physical_gradient_func, cache=True, logger=logger)
-                            else:
-                                self.log('Performing standard DDIM steps...')
-                                xs, _ = ddim_steps(x, seq, model, betas, cache=True, logger=logger)
-
-                            self.log(f'Sequence of images (xs) generated for iteration {it}. Total steps: {len(xs)}')
-                                                
-                            x = xs[-1]  # Get the final image
-                            x0 = xs[-1].to(self.device)
-
-                            self.log(f'Imaged saved as comparison_run_{repeat}_it{it}.png.')
-                            # Optionally dump arrays
-                            if self.config.sampling.dump_arr:
-                                np.save(os.path.join(self.image_sample_dir, sample_folder, f'sample_arr_run_{repeat}_it{it}.npy'),
-                                        slice2sequence(scaler.inverse(x)).cpu().numpy())
-                            
-                            # Log losses if enabled
-                            if self.config.sampling.log_loss:
-                                logger.log(os.path.join(self.image_sample_dir, sample_folder), f'run_{repeat}_it{it}')
-                                logger.reset()
-                                print(f'Logged and reset the logger for iteration {it}.')
+                            self.log('Performing standard DDIM steps without physical guidance...')
+                            xs, _ = ddim_steps(x, seq, model, betas, cache=False, logger=logger)
+                        elif self.config.sampling.lambda_ > 0:
+                            self.log('Performing guided DDIM steps with lambda > 0...')
+                            xs, _ = ddim_steps(x, seq, model, betas,
+                                            dx_func=physical_gradient_func, cache=True, logger=logger)
                         else:
-                            print(f'TESTING THIS CODE !!!!')
-                    print(f'=== Finished Run No.{repeat} ===')
+                            self.log('Performing standard DDIM steps...')
+                            xs, _ = ddim_steps(x, seq, model, betas, cache=True, logger=logger)
+
+                        self.log(f'Sequence of images (xs) generated for iteration {it}. Total steps: {len(xs)}')
+
+                        x = xs[-1]  # Get the final 6-channel image state
+                        x0 = xs[-1].to(self.device)
+
+                        self.log(f'Imaged saved as comparison_run_{repeat}_it{it}.png.')
+                        # Optionally dump arrays
+                        if self.config.sampling.dump_arr:
+                            u_physical = x[:, :3] * x_scale + x_offset
+                            v_physical = x[:, 3:6] * y_scale + y_offset
+                            magnitude = torch.sqrt(u_physical.square() + v_physical.square())
+                            output_dir = os.path.join(self.image_sample_dir, sample_folder)
+
+                            np.save(
+                                os.path.join(output_dir, f'sample_u_run_{repeat}_it{it}.npy'),
+                                u_physical.cpu().numpy(),
+                            )
+                            np.save(
+                                os.path.join(output_dir, f'sample_v_run_{repeat}_it{it}.npy'),
+                                v_physical.cpu().numpy(),
+                            )
+                            np.save(
+                                os.path.join(output_dir, f'sample_magnitude_run_{repeat}_it{it}.npy'),
+                                magnitude.cpu().numpy(),
+                            )
+
+                        # Log losses if enabled
+                        if self.config.sampling.log_loss and logger is not None:
+                            logger.log(os.path.join(self.image_sample_dir, sample_folder), f'run_{repeat}_it{it}')
+                            logger.reset()
+                            print(f'Logged and reset the logger for iteration {it}.')
+                    else:
+                        print(f'TESTING THIS CODE !!!!')
+                print(f'=== Finished Run No.{repeat} ===')
             self.log('Finished batch {}'.format(batch_index))
             self.log('========================================================')
         self.log('Finished sampling')
