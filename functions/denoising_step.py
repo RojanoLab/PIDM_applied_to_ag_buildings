@@ -236,7 +236,7 @@ def guided_ddim_steps(x, seq, model, b, **kwargs):
             c2 = (1 - at_next).sqrt()
 
         with torch.no_grad():
-            # 4. Restamos la guía física dx_scaled en el paso DDIM
+            # 4. Subtract the physical guidance dx_scaled at the DDIM step
             xt_next = at_next.sqrt() * x0_t + c2 * et - (dx_scaled * dx_scale)
             if clamp_func is not None:
                 xt_next = clamp_func(xt_next)
