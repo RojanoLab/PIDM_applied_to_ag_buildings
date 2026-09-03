@@ -1,6 +1,5 @@
 import torch
 
-
 def compute_alpha(beta, t):
     beta = torch.cat([torch.zeros(1).to(beta.device), beta], dim=0)
     a = (1 - beta).cumprod(dim=0).index_select(0, t + 1).view(-1, 1, 1, 1)
@@ -131,8 +130,7 @@ def guided_ddpm_steps(x, seq, model, b,  **kwargs):
         dx = dx_func(x)
         with torch.no_grad():
 
-            # output = (w+1)*model(x, t.float(), dx)-w*model(x, t.float())
-            output = (w+1)*model(x, t.float())-w*model(x, t.float())
+            output = (w+1)*model(x, t.float(), dx)-w*model(x, t.float())
             e = output
 
             x0_from_e = (1.0 / at).sqrt() * x - (1.0 / at - 1).sqrt() * e
@@ -166,48 +164,89 @@ def guided_ddim_steps(x, seq, model, b, **kwargs):
     seq_next = [-1] + list(seq[:-1])
     x0_preds = []
     xs = [x]
-    # ys = [y]
+    
     dx_func = kwargs.get('dx_func', None)
     if dx_func is None:
         raise ValueError('dx_func is required for guided denoising')
+
+    input_fn = kwargs.get('input_fn', None)
+
+    cond = kwargs.get('dx', None)
+    if cond is None:
+        raise ValueError('dx (condición de entrada) is required for guided denoising')
+
     clamp_func = kwargs.get('clamp_func', None)
     cache = kwargs.get('cache', False)
     w = kwargs.get('w', 3.0)
+    w_min = kwargs.get('w_min', w)
+    dx_scale = kwargs.get('dx_scale', 1.0)
     logger = kwargs.get('logger', None)
-    if logger is not None:
-        logger.update(x=xs[-1])
 
-    for i, j in zip(reversed(seq), reversed(seq_next)):
+
+    if logger is not None:
+        logger.update(x=xs[-1].to('cuda'))    
+
+    total_steps = max(1, len(seq))
+    for step_idx, (i, j) in enumerate(zip(reversed(seq), reversed(seq_next))):
         with torch.no_grad():
             t = (torch.ones(n) * i).to(x.device)
             next_t = (torch.ones(n) * j).to(x.device)
             at = compute_alpha(b, t.long())
             at_next = compute_alpha(b, next_t.long())
             xt = xs[-1].to('cuda')
-            # yt = ys[-1].to('cuda')
 
-        dx = dx_func(xt)
-        #dy = dx_func(yt)
+        # dx_func returns (dx, dx_scaled).
+        # dx is the unscaled physical-unit condition expected by the model.
+        # dx_scaled is used only for the DDIM update in z-score space.
+        dx, dx_scaled = dx_func(xt)
+
+        # Keep the full 6-channel conditioning tensor expected by the
+        # conditional model ([u, v] concatenated). Do not crop it to 3 channels.
+        if dx.shape[1] != 6:
+            raise ValueError(f"Expected 6-channel conditioning tensor for the conditional model, got shape {tuple(dx.shape)}")
+
+        # ── DIAGNÓSTICO ──
+        if i in list(reversed(list(seq)))[:3]:
+            dx_norm = dx_scaled.norm().item()
+            dx_mean_abs = dx_scaled.abs().mean().item()
+            dx_max = dx_scaled.abs().max().item()
+            print(f"[DIAG | t={int(i):4d}] dx_scaled norm={dx_norm:.6f} | mean_abs={dx_mean_abs:.6f} | max={dx_max:.6f}")
 
         with torch.no_grad():
+            model_input = input_fn(xt) if input_fn is not None else xt
 
-            et = (w+1)*model(xt, t, dx) - w*model(xt, t)
-            # et = (w+1)*model(xt, t) - w*model(xt, t)
-           
+            # Linearly decay guidance strength from w to w_min across reverse steps.
+            progress = step_idx / max(1, total_steps - 1)
+            w_t = w + (w_min - w) * progress
+
+            # The conditional model was trained with the physical residual
+            # guidance dx as an additional condition.
+            et = (w_t + 1) * model(model_input, t, dx) - w_t * model(model_input, t)
+
+            # ── DIAGNÓSTICO ──
+            if i in list(reversed(list(seq)))[:3]:
+                et_dm   = model(model_input, t)
+                et_pidm = (w+1)*model(model_input, t, dx) - w*model(model_input, t)
+                diff_et = (et_pidm - et_dm).abs().mean().item()
+                print(f"[DIAG | t={int(i):4d}] |et_pidm - et_dm| mean = {diff_et:.8f}")
+
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
             x0_preds.append(x0_t.to('cpu'))
 
             c2 = (1 - at_next).sqrt()
 
         with torch.no_grad():
-            xt_next = at_next.sqrt() * x0_t + c2 * et - dx
-            # xt_next = at_next.sqrt() * x0_t + c2 * et
+            # 4. Restamos la guía física dx_scaled en el paso DDIM
+            xt_next = at_next.sqrt() * x0_t + c2 * et - (dx_scaled * dx_scale)
             if clamp_func is not None:
                 xt_next = clamp_func(xt_next)
+            
             xs.append(xt_next.to('cpu'))
 
+
         if logger is not None:
-            logger.update(x=xs[-1])
+            logger.update(x=xs[-1].to('cuda'))    
+
 
         if not cache:
             xs = xs[-1:]
