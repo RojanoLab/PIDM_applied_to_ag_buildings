@@ -111,7 +111,7 @@ Key training hyperparameters (set in `train_ddpm/configs/vel_256_512_conditional
 | Image size | 1024 × 512 |
 | Channels | 6 |
 | Batch size | 12 |
-| Epochs | 1 000 |
+| Epochs | 1 600 |
 | Iterations | 320 000 |
 | Optimizer | Adam (lr = 2e-4) |
 | Diffusion timesteps | 1 000 |
