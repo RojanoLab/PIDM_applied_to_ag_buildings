@@ -27,11 +27,40 @@ torch.manual_seed(0)
 np.random.seed(0)
 
 
+def _converted_to_physical_linear_params(data_mean, data_scale,
+                                          physical_min: float, physical_max: float,
+                                          pix_max: float, pix_min: float):
+    """Compose z-score inverse with pixel->physical mapping into y = x*scale + offset."""
+    if pix_max <= pix_min:
+        raise ValueError(f"Invalid pixel bounds: pix_max={pix_max}, pix_min={pix_min}")
+
+    data_mean = float(data_mean)
+    data_scale = float(data_scale)
+    gain = (physical_max - physical_min) / (pix_max - pix_min)
+
+    scale = data_scale * gain
+    offset = (data_mean - pix_min) * gain + physical_min
+    return offset, scale
+
+
 def _resolve_num_workers(requested_workers):
     if os.name == "nt" and requested_workers > 0:
         logging.warning("Windows detected: overriding DataLoader num_workers from %s to 0", requested_workers)
         return 0
     return requested_workers
+
+# def visualize_tensor(tensor, idx=0):                         --------------------------imagenes
+#     img = tensor[idx].detach().cpu().numpy()  # (C,H,W)
+#     if img.shape[0] == 3:
+#         img = img.transpose(1, 2, 0)  # Cambia a (H,W,C)
+#     # Normaliza para que esté entre 0 y 1
+#     img_min, img_max = img.min(), img.max()
+#     img = (img - img_min) / (img_max - img_min + 1e-8)
+#     plt.imshow(img)
+#     plt.axis('off')
+#     plt.show()
+                                                    #------------------------------------------------
+
 
 def torch2hwcuint8(x, clip=False):
     if clip:
@@ -405,7 +434,7 @@ class ConditionalDiffusion(object):
 
     
     
-    def train(self, data_dir, stat_path, data_dir_y, stat_path_y):
+    def train(self, data_dir, stat_path, data_diry, stat_pathy):
         args, config = self.args, self.config
         tb_logger = self.config.tb_logger
         file_name = os.path.splitext(os.path.basename(data_dir))[0]
@@ -420,18 +449,30 @@ class ConditionalDiffusion(object):
             
             train_data = KMFlowTensorDataset(data_dir, )
             train_data.save_data_stats(stat_path)
-        # Load training and test datasets y
-        if os.path.exists(stat_path_y):
-            print("Loading dataset statistics y from {}".format(stat_path_y))
-            train_datay = KMFlowTensorDataset(data_dir_y, stat_path=stat_path_y)
+# Load training and test datasets y
+        if os.path.exists(stat_pathy):
+            print("Loading dataset statistics y from {}".format(stat_pathy))
+            train_datay = KMFlowTensorDataset(data_diry, stat_path=stat_pathy)
                         
         else:
             
-            train_datay = KMFlowTensorDataset(data_dir_y, )
-            train_datay.save_data_stats(stat_path_y)
-            
-        x_offset, x_scale = train_data.stat['mean'], train_data.stat['scale']
-        y_offset, y_scale = train_datay.stat['mean'], train_datay.stat['scale']
+            train_datay = KMFlowTensorDataset(data_diry, )
+            train_datay.save_data_stats(stat_pathy)
+
+
+        # Convert normalized tensors to physical units in the loss using requested bounds:
+        # u_phys = convert_to_physical(img1_t, -7.0, 17.0, 246.0, 0)
+        # v_phys = convert_to_physical(img3_t, -5.0, 9.0, 244.0, 0)
+        x_offset, x_scale = _converted_to_physical_linear_params(
+            train_data.stat['mean'], train_data.stat['scale'],
+            physical_min=-7.0, physical_max=17.0,
+            pix_max=246.0, pix_min=0.0
+        )
+        y_offset, y_scale = _converted_to_physical_linear_params(
+            train_datay.stat['mean'], train_datay.stat['scale'],
+            physical_min=-5.0, physical_max=9.0,
+            pix_max=254.0, pix_min=0.0
+        )
 
         train_loader = torch.utils.data.DataLoader(train_data,
                                                    batch_size=config.training.batch_size,
@@ -443,12 +484,8 @@ class ConditionalDiffusion(object):
                                                    shuffle=False,
                                                    num_workers=num_workers)
 
-        x_offset, x_scale = train_data.stat['mean'], train_data.stat['scale']
 
-        train_loader = torch.utils.data.DataLoader(train_data,
-                                                   batch_size=config.training.batch_size,
-                                                   shuffle=True,
-                                                   num_workers=num_workers)
+       
         
         model = ConditionalModel(config)
         # num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -496,7 +533,11 @@ class ConditionalDiffusion(object):
                 y = y.to(self.device)  
                 # print(f"This is the shape for x {x.shape}", f"and this is the shape for y {y.shape}")
                     
-                e = torch.randn_like(x)   #Create a tensor of the same size as x with random numbers from a N(0, 1) distribution
+                if config.model.in_channels == x.shape[1] + y.shape[1]:
+                    # Dual-field mode: independent noise for x and y channels.
+                    e = torch.cat([torch.randn_like(x), torch.randn_like(y)], dim=1)
+                else:
+                    e = torch.randn_like(x)
                 b = self.betas   #Save the betas using a linear function defined with NumPy
                
                
@@ -508,20 +549,10 @@ class ConditionalDiffusion(object):
 
                 t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]   # (self.num_timsteps -t) Generate the antithetic part, also 17 values = 999 - t = [996, 579, 986, 972, 444, 910, 211, 849, 329,769, 597, 685, 994, 299, 899, 979, 187]
                 
+                                                                            #The two vectors are concatenated (32 elements); that is [:n] along dimension 0, and then –1 is subtracted from each element.
                 
-                loss = loss_registry[config.model.type](
-                    model,
-                    x,
-                    y,
-                    t,
-                    e,
-                    b,
-                    x_offset.item(),
-                    x_scale.item(),
-                    y_offset.item(),
-                    y_scale.item(),
-                    ke_path=self.config.data.data_dir_ke,
-                )  # In loss_registry, noise is added before entering the model.
+                
+                loss = loss_registry[config.model.type](model, x, y, t, e, b, x_scale, x_offset, y_scale, y_offset)  # In loss_registry, noise is added before entering the model.
 
                 epoch_loss.append(loss.item())
 
