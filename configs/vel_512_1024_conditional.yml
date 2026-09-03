@@ -4,7 +4,7 @@ data:
     dataset: "kmflow"
     category: "kmflow"
     image_size: [1024,512]
-    channels: 3
+    channels: 6
     num_workers: 4
     data_dir_gtx: "./data/test_Vel_X.npy"         # Ground truth x-vel NPY file
     data_dir_gux: "./data/test_Vel_X_guided.npy"  # Guided images g(u)
@@ -19,8 +19,8 @@ data:
 
 model:
     type: "conditional"
-    in_channels: 3 #4
-    out_ch: 3 #4
+    in_channels: 6 #4
+    out_ch: 6 #4
     ch: 64
     ch_mult: [ 1, 1, 1, 2 ]
     num_res_blocks: 1
