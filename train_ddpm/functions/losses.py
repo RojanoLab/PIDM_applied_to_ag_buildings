@@ -1,286 +1,159 @@
-
 import torch
-import numpy as np
-import os
-import pandas as pd
-from torch.optim.sgd import SGD
+import torch.nn.functional as F
 
-# Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# _KE_EPS_PATH = r"C:\Users\Rojano\Documents\diffusion_final\data\prediction_k_eps_mean.npz"
-_KE_EPS_CACHE= {}
-
-
-def _get_ke_init_tensors(target_device, ke_path=None):
-    source_path = ke_path 
-    cache_key = f"{str(target_device)}::{source_path}"
-    if cache_key not in _KE_EPS_CACHE:
-        with np.load(source_path) as data_npz:
-            k_load = data_npz["k"]
-            eps_load = data_npz["epsilon"]
-
-        k_init = torch.from_numpy(k_load).to(target_device, dtype=torch.float32)
-        eps_init = torch.from_numpy(eps_load).to(target_device, dtype=torch.float32)
-        k_init = torch.clamp(k_init, min=1e-8)
-        eps_init = torch.clamp(eps_init, min=1e-8)
-        _KE_EPS_CACHE[cache_key] = (k_init, eps_init)
-    return _KE_EPS_CACHE[cache_key]
-
-# (convert_to_physical, solve_poisson_iterative, precompute_static_derivatives, compute_residuals_jit)
-@torch.jit.script
-def convert_to_physical(img_float, physical_min: float, physical_max: float, pix_max: float, pix_min: float):
-    img_clamped = torch.clamp(img_float, min=pix_min, max=pix_max)
-    normalized_img = (img_clamped - pix_min) / (pix_max - pix_min)
-    return normalized_img * (physical_max - physical_min) + physical_min
-
-@torch.jit.script
-def solve_poisson_iterative(source_term, p_init, dx: float, dy: float, iterations: int):
-    p = p_init.clone()
-    ax = dy / dx
-    ay = dx / dy
-    ap = -2 * (ax + ay)
-    const = source_term * dx * dy
+def get_safe_fluid_mask(x0: torch.Tensor, y0: torch.Tensor, threshold: float = 1e-3) -> torch.Tensor:
+    """
+    Dynamically generates a fluid mask from ground truth velocity fields (x0, y0)
+    and erodes fluid boundaries by 2 pixels to eliminate stencil overlap artifacts.
     
-    for _ in range(iterations):
-        p_E = torch.roll(p, -1, 1); p_W = torch.roll(p, 1, 1)
-        p_N = torch.roll(p, -1, 0); p_S = torch.roll(p, 1, 0)
-        p = (ax * (p_E + p_W) + ay * (p_N + p_S) - const) / -ap
-        
-        # BCs
-        p[:, 0] = p[:, 1]; p[:, -1] = 0.0
-        p[0, :] = p[1, :]; p[-1, :] = p[-2, :]
-        
-    return p
-
-@torch.jit.script
-def precompute_static_derivatives(u, v, dx: float, dy: float):
-    u_E = torch.roll(u, -1, 1); u_W = torch.roll(u, 1, 1)
-    u_N = torch.roll(u, -1, 0); u_S = torch.roll(u, 1, 0)
-    v_E = torch.roll(v, -1, 1); v_W = torch.roll(v, 1, 1)
-    v_N = torch.roll(v, -1, 0); v_S = torch.roll(v, 1, 0)
-
-    du_dx = (u_E - u_W) / (2 * dx); dv_dy = (v_N - v_S) / (2 * dy)
-    du_dy = (u_N - u_S) / (2 * dy); dv_dx = (v_E - v_W) / (2 * dx)
-
-    S2_static = 2*(du_dx**2) + 2*(dv_dy**2) + (du_dy + dv_dx)**2
+    Returns:
+        safe_fluid_mask: [B, 1, H, W] tensor (1.0 for valid fluid interior, 0.0 for walls/boundaries)
+    """
+    # 1. Identify fluid cells from clean ground truth (where velocity > threshold)
+    raw_fluid_mask = ((x0.abs() > threshold) | (y0.abs() > threshold)).float()
     
-    return S2_static, du_dx, du_dy, dv_dx, dv_dy, u_E, u_W, u_N, u_S
-@torch.jit.script
-def compute_residuals_jit( k_val, eps_val, alpha_val, u, v, S2_static, dp_dx_static, adv_term_u_static, dx: float, dy: float, rho: float, nu: float):
-    # Clamp exponent inputs to keep values in a numerically stable range.
-
-    k = k_val
-    eps = eps_val
-    alpha = 4.0 * torch.sigmoid(alpha_val) - 2.0
-
-
-    C_mu = 0.09
-    nu_t = C_mu * (k**2) / (eps + 1e-10)
-    effective_nu = nu + nu_t 
-
-    # Momentum Residual
-    u_E = torch.roll(u, -1, 1); u_W = torch.roll(u, 1, 1)
-    u_N = torch.roll(u, -1, 0); u_S = torch.roll(u, 1, 0)
+    # 2. Invert to create a wall mask (1.0 for wall, 0.0 for fluid)
+    wall_mask = 1.0 - raw_fluid_mask
     
-    eff_nu_e = (effective_nu + torch.roll(effective_nu, -1, 1)) / 2
-    eff_nu_w = (effective_nu + torch.roll(effective_nu, 1, 1)) / 2
-    eff_nu_n = (effective_nu + torch.roll(effective_nu, -1, 0)) / 2
-    eff_nu_s = (effective_nu + torch.roll(effective_nu, 1, 0)) / 2
+    # 3. Expand wall boundaries by 2 pixels using max_pool2d (kernel=5, stride=1, padding=2)
+    #    This covers the 2-pixel reach of the 5-point finite difference stencil
+    expanded_wall = F.max_pool2d(wall_mask, kernel_size=5, stride=1, padding=2)
     
-    diff_term_u = ((rho * eff_nu_e * (u_E - u) / dx) - (rho * eff_nu_w * (u - u_W) / dx)) / dx + \
-                  ((rho * eff_nu_n * (u_N - u) / dy) - (rho * eff_nu_s * (u - u_S) / dy)) / dy
+    # 4. Safe fluid interior: 1.0 only where stencil reads pure fluid data
+    safe_fluid_mask = 1.0 - expanded_wall
+    return safe_fluid_mask
+
+
+def compute_5point_divergence(u: torch.Tensor, v: torch.Tensor, dx: float = 0.0358203125, dy: float = 0.0358203125) -> torch.Tensor:
+    """
+    Computes spatial divergence (du/dx + dv/dy) using a 4th-order 5-point stencil.
+    Expects 1-channel u and v tensors: [B, 1, H, W].
+    """
+    in_channels = u.shape[1]
+
+    # 4th-order finite difference kernel
+    kernel_1d = torch.tensor([1/12, -8/12, 0.0, 8/12, -1/12], dtype=torch.float32, device=u.device)
+    kernel_x = kernel_1d.view(1, 1, 1, 5).repeat(in_channels, 1, 1, 1)
+    kernel_y = kernel_1d.view(1, 1, 5, 1).repeat(in_channels, 1, 1, 1)
+
+    u_padded_x = F.pad(u, (2, 2, 0, 0), mode='replicate')
+    v_padded_y = F.pad(v, (0, 0, 2, 2), mode='replicate')
+
+    du_dx = F.conv2d(u_padded_x, kernel_x, groups=in_channels) / dx
+    dv_dy = F.conv2d(v_padded_y, kernel_y, groups=in_channels) / dy
+
+    return du_dx + dv_dy
+
+def velocity_residual(w: torch.Tensor, 
+                      w2: torch.Tensor, 
+                      safe_mask: torch.Tensor, 
+                      dx_spacing: float = 0.0358203125, 
+                      dy_spacing: float = 0.0358203125, 
+                      calc_grad: bool = False):
+
+    """
+    Computes divergence loss restricted strictly to safe fluid regions
+    and extracts 2-channel steering gradients [grad_u, grad_v].
+    """
+    # Detach first to break computation graph, then clone and set requires_grad
+    w = w.detach().clone().requires_grad_(True)
+    w2 = w2.detach().clone().requires_grad_(True)
+
+    # 1. Compute raw 5-point spatial divergence
+    vel_res = compute_5point_divergence(w, w2, dx=dx_spacing, dy=dy_spacing)
+
+    # 2. ZERO OUT boundary stencil spikes and wall cells
+    masked_res = vel_res * safe_mask
+
+    # 3. Calculate physical mean loss on clean interior fluid pixels
+    residual_loss = torch.nan_to_num((masked_res**2).mean(), nan=1e6, posinf=1e6, neginf=1e6)
+
+    # 4. Compute steering sensitivity gradients for BOTH components
+    grads = torch.autograd.grad(residual_loss, [w, w2], create_graph=False, retain_graph=False)
+    wr_u, wr_v = grads[0], grads[1]
+
+    # 5. Concatenate into a 2-channel steering guidance tensor [B, 2, H, W]
+    dx = torch.cat([wr_u, wr_v], dim=1)
     
-    res_mom = ( adv_term_u_static) + ((1 - alpha)* dp_dx_static) - diff_term_u
+    if calc_grad:
+        return residual_loss, dx
     
-    res = res_mom / rho
-    return torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
-
-def normalize_to_01(image_array):
-    """Scales a NumPy array to the range [0, 1]."""
-    min_val = -7
-    max_val = 17
+    return dx
     
-    if max_val - min_val > 0:
-        return (image_array - min_val) / 24
-    else:
-        return torch.zeros(image_array.shape)
 
+def conditional_noise_estimation_loss(model,
+                                       x0: torch.Tensor,        # [B, 3, H, W] Clean u
+                                       y0: torch.Tensor,        # [B, 3, H, W] Clean v
+                                       t: torch.LongTensor,     # [B] Timesteps
+                                       e: torch.Tensor,         # [B, 6, H, W] Independent 2-channel noise
+                                       b: torch.Tensor,         # Noise schedule beta
+                                       x_scale, x_offset,
+                                       y_scale, y_offset,
+                                       keepdim=False):
 
-def main_code(w, w2, ke_path=None):
-    w = w.clone()
-    w.requires_grad_(True)
-    w2 = w2.clone()
-    w2.requires_grad_(True)
+    """
+    Physically-guided 2-channel vector diffusion loss function with dynamic wall masking.
+    """
+    # 1. Compute dynamic fluid mask eroded by 2 pixels for current batch
+    safe_mask = get_safe_fluid_mask(x0, y0)
 
-    # Physics Parameters
-    params = {"dx": 0.071640625, "nu": 1.46e-5, "rho": 1.225, "mu": 1.78e-5}
-    OPTIM_STEPS = 100  
-    # EARLY_STOP_PATIENCE = 40
-    # EARLY_STOP_MIN_DELTA = 1e-8
-    OUTPUT_CSV = "sequence_statistics_optimized3.csv"
-    if not os.path.exists(OUTPUT_CSV):
-        df_init = pd.DataFrame(columns=[
-            "Alpha", "RMSE_Momentum"
-        ])
-        df_init.to_csv(OUTPUT_CSV, index=False)
+    # 2. Diffusion forward setup with independent noise components
+    a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
 
-    u_phys = convert_to_physical(w, -7.0, 17.0, 246.0, 0)
-    v_phys = convert_to_physical(w2, -5.0, 9.0, 244.0, 0)
+    e_x = e[:, 0:3]  
+    e_y = e[:, 3:6]  
 
-    # Use detached tensors inside the inner optimizer loop to avoid
-    # backpropagating through the outer training graph multiple times.
-    u_phys_opt = u_phys.detach()
-    v_phys_opt = v_phys.detach()
-    
-    # 3. Precompute Static Fields
-    dx, dy = params["dx"], params["dx"]
-    rho, mu = params["rho"], params["mu"]
-    
-    S2_static, du_dx, du_dy, dv_dx, dv_dy, u_E, u_W, u_N, u_S = precompute_static_derivatives(u_phys, v_phys, dx, dy)
-    
-    d2u_dx2 = (u_E - 2*u_phys + u_W)/dx**2; d2u_dy2 = (u_N - 2*u_phys + u_S)/dy**2
-    d2v_dx2 = (torch.roll(v_phys,-1,1) - 2*v_phys + torch.roll(v_phys,1,1))/dx**2 
-    d2v_dy2 = (torch.roll(v_phys,-1,0) - 2*v_phys + torch.roll(v_phys,1,0))/dy**2
-    
-    Fx = rho*(u_phys*du_dx + v_phys*du_dy) - mu*(d2u_dx2 + d2u_dy2)
-    Fy = rho*(u_phys*dv_dx + v_phys*dv_dy) - mu*(d2v_dx2 + d2v_dy2)
-    
-    div_F = (torch.roll(Fx,-1,1)-torch.roll(Fx,1,1))/(2*dx) + (torch.roll(Fy,-1,0)-torch.roll(Fy,1,0))/(2*dy)
-    source_term = -div_F
-    
-    p_init = torch.zeros_like(source_term)
-    p_field = solve_poisson_iterative(source_term, p_init, dx, dy, 50)
-    dp_dx_static = (torch.roll(p_field,-1,1) - torch.roll(p_field,1,1)) / (2*dx)
+    x = x0 * a.sqrt() + e_x * (1.0 - a).sqrt()
+    y = y0 * a.sqrt() + e_y * (1.0 - a).sqrt()
 
-    mask_u = (u_phys > 0).float()
-    du_dx_up = mask_u * (u_phys - u_W)/dx + (1 - mask_u) * (u_E - u_phys)/dx
-    mask_v = (v_phys > 0).float()
-    du_dy_up = mask_v * (u_phys - u_S)/dy + (1 - mask_v) * (u_N - u_phys)/dy
-    adv_term_u_static = (u_phys * du_dx_up + v_phys * du_dy_up)
+    # 3. Unscale to physical velocity units (m/s)
+    u_phys = (x * x_scale + x_offset) 
+    v_phys = (y * y_scale + y_offset) 
 
-    # Load once per process and reuse for all subsequent calls.
-    k, eps = _get_ke_init_tensors(device, ke_path=ke_path)
-    # Convert arrays to tensors for JIT function inputs.
-    # Initialize Learnable Parameters
-    alpha = torch.tensor([-0.8569], device=device, requires_grad=True)
+    # 4. Compute 2-channel steering guidance dx using the safe fluid mask
+    dx = velocity_residual(u_phys, v_phys, safe_mask)  # Shape: [B, 6, H, W]
 
-    optimizer = SGD([alpha], lr=0.05)
-    
-    # Scaling factors for loss
-    U_scale = torch.sqrt(u_phys_opt**2 + v_phys_opt**2) + 1e-10
-    L_scale = params["dx"] * u_phys.shape[1]
-    scale_mom = (U_scale**2/L_scale)
-    res_acc_mom = torch.zeros_like(u_phys)
+    # 5. Concatenate noisy states into 2-channel input
+    vel_input = torch.cat([x, y], dim=1)  # Shape: [B, 6, H, W]
 
-    S2_static_opt = S2_static.detach()
-    dp_dx_static_opt = dp_dx_static.detach()
-    adv_term_u_static_opt = adv_term_u_static.detach()
-    
-    # Run Optimization
-    for epoch in range(OPTIM_STEPS):
-        optimizer.zero_grad()
-        res_acc_mom = compute_residuals_jit(
-            k, eps, alpha, u_phys_opt, v_phys_opt, S2_static_opt,
-            dp_dx_static_opt, adv_term_u_static_opt, dx, dy, rho, params["nu"]
-        )
-    
-        # Loss Calculation
-        total_loss = torch.mean(((res_acc_mom) / scale_mom)**2)
-        loss_alpha_reg = 0.00001 * (alpha ** 2).mean()
-        total_loss = total_loss + loss_alpha_reg
-        total_loss.backward()
-        optimizer.step()
+    # 6. Forward pass through model predicting 2-channel noise
+    output = model(vel_input, t.float(), dx)
 
-    # 6. Extract Final Results
-    # Recompute residual on the original graph once, using optimized coefficients.
-    res_acc_mom = compute_residuals_jit(
-        k.detach(), eps.detach(), alpha.detach(), u_phys, v_phys, S2_static,
-        dp_dx_static, adv_term_u_static, dx, dy, rho, params["nu"]
-    )
-    dt_char = params["dx"] / (torch.max(torch.sqrt(u_phys**2 + v_phys**2)) + 1e-10)
-    vel_res = res_acc_mom * dt_char
-    rmse = torch.sqrt(torch.mean(vel_res**2)).item()
-    # 7. Save Stats
-    alpha_value = (4.0 * torch.sigmoid(alpha.detach()) - 2.0)[0].item()
-    stats = {
-            "Alpha": alpha_value,
-        "RMSE_Momentum": rmse,
-    }
-    
-    df_new = pd.DataFrame([stats])
-    df_new.to_csv(OUTPUT_CSV, mode='a', header=False, index=False)
+    output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
 
-    vel_res_u = normalize_to_01(torch.nan_to_num(vel_res, nan=0.0, posinf=1e6, neginf=-1e6)) 
-    residual_loss = torch.nan_to_num((vel_res_u**2).mean(), nan=1e6, posinf=1e6, neginf=1e6)
-    wr = torch.autograd.grad(residual_loss, w)[0]
-    return wr
-
-
-def velocity_residual(w, w2, ke_path=None):
-    
-    dw = main_code(w, w2, ke_path=ke_path)
-
-    return dw
-
-
-def noise_estimation_loss(model,
-                          x0: torch.Tensor,
-                          t: torch.LongTensor,
-                          e: torch.Tensor,
-                          b: torch.Tensor,
-                         keepdim=False):
-    a = (1-b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
-    x = x0 * a.sqrt() + e * (1.0 - a).sqrt()
-    output = model(x, t.float())
-    
+    # 7. Compute loss against target 2-channel noise tensor e
     if keepdim:
         return (e - output).square().sum(dim=(1, 2, 3))
     else:
         return (e - output).square().sum(dim=(1, 2, 3)).mean(dim=0)
 
 
-def conditional_noise_estimation_loss(model,
+def noise_estimation_loss(model,
                           x0: torch.Tensor,
-                          y0: torch.Tensor,                                                    
+                          y0: torch.Tensor,
                           t: torch.LongTensor,
                           e: torch.Tensor,
                           b: torch.Tensor,
-                          x_scale,
-                          x_offset,
-                          y_scale,
-                          y_offset,
-                          keepdim=False, p=0.1, ke_path=None):
-
-    a = (1-b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)  
-    x = x0 * a.sqrt() + e * (1.0 - a).sqrt()
-    y = y0 * a.sqrt() + e * (1.0 - a).sqrt()     
-                            
-        
-    dx = velocity_residual(
-        x * x_scale + x_offset / x_scale,
-        y * y_scale + y_offset / y_scale,
-        ke_path=ke_path,
-    )
-
-    # dx = velocity_residual(x, y
-    #     ) 
+                          keepdim=False):
     
-                 #-----------------------
-    # output = model(x, t.float(), dx)
-    output = model(x, t.float(), dx)
-    output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
 
-   
+    """Unconditioned 2-channel noise estimation loss."""
+    a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
 
-    # exit() 
+    e_x = e[:, 0:1]
+    e_y = e[:, 1:2] 
 
-    # print(f"output shape: {output.shape}")
+    x = x0 * a.sqrt() + e_x * (1.0 - a).sqrt()
+    y = y0 * a.sqrt() + e_y * (1.0 - a).sqrt()
+
+    vel_input = torch.cat([x, y], dim=1)
+    
+    output = model(vel_input, t.float())
+
     if keepdim:
         return (e - output).square().sum(dim=(1, 2, 3))
     else:
-        r=(e - output).square().sum(dim=(1, 2, 3)).mean(dim=0)
-        # print(f"r shape: {r}")
-        return r
+        return (e - output).square().sum(dim=(1, 2, 3)).mean(dim=0)
 
 
 loss_registry = {
