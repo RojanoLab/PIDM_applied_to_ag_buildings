@@ -104,7 +104,7 @@ python main.py \
     --ni
 ```
 
-Key training hyperparameters (set in `train_ddpm/configs/vel_256_512_conditional.yml`):
+Key training hyperparameters (set in `train_ddpm/configs/vel_512_1024_conditional.yml`):
 
 | Parameter | Value |
 |-----------|-------|
