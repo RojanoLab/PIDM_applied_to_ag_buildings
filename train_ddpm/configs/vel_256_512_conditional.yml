@@ -4,7 +4,6 @@ data:
     stat_path_x: "../data/train_512-1024_Vel_X_stats.npz"
     data_dir_y: "../data/train_Vel_Y.npy"
     stat_path_y: "../data/train_512-1024_Vel_Y_stats.npz"
-    data_dir_ke: "../data/mean_ke.npz"                     # Kinetic energy npz file
 
     image_size: [1024,1024]
     channels: 6
