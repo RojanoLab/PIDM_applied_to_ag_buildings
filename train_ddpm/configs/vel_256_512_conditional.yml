@@ -5,7 +5,7 @@ data:
     data_dir_y: "../data/train_Vel_Y.npy"
     stat_path_y: "../data/train_512-1024_Vel_Y_stats.npz"
 
-    image_size: [1024,1024]
+    image_size: [1024, 512]
     channels: 6
     logit_transform: false
     uniform_dequantization: false
