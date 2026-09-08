@@ -62,7 +62,7 @@ The training data consists of 2D turbulent velocity fields with the following pr
 | `test_Vel_X_guided.npy` | `(N, T, 512, 1024)` | uint8/float | Guided conditioning signal `g(u)` |
 | `test_Vel_Y.npy` | `(N, T, 512, 1024)` | uint8/float | Y-component reference fields |
 
-[Download](https://figshare.com/ndownloader/files/63064630) and unzip all data files to be placed inside the `./data/` subdirectory before running any experiment.
+[Download](https://huggingface.co/datasets/sisi-guevara-ml/data-PIDM/resolve/main/Data.tar.gz?download=true) and unzip all data files to be placed inside the `./data/` subdirectory before running any experiment.
 
 For reconstruction (sampling), the default config expects test files under `./data/`:
 
