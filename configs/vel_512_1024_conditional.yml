@@ -30,7 +30,7 @@ model:
     ema_rate: 0.9999
     ema: True
     resamp_with_conv: True
-    ckpt_path: "./pretrained_weights/ckpt_Vel_X.pth" 
+    ckpt_path: "./pretrained_weights/ckpt_Vel_X-Y.pth" 
 
 diffusion:
     beta_schedule: linear
