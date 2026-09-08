@@ -91,7 +91,6 @@ def _nice_tick_step(value_range, target_ticks=9):
             return step
     return 10 * magnitude
 
-
 def _format_tick(value, step):
     if step >= 1:
         return f'{value:.0f}'
