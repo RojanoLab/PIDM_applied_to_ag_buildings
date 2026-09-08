@@ -10,6 +10,8 @@ data:
     data_dir_gux: "./data/test_Vel_X_guided.npy"  # Guided images g(u)
     data_dir_gty: "./data/test_Vel_Y.npy"          # Ground truth y-vel NPY file
     data_dir_guy: "./data/test_Vel_Y_guided.npy"
+    stat_path_x: "../data/train_512-1024_Vel_X_stats.npz"
+    stat_path_y: "../data/train_512-1024_Vel_Y_stats.npz"
     data_kw: ''
     smoothing: True
     smoothing_scale: 8  # Add this line with a reasonable default value
