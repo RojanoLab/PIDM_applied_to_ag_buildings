@@ -127,7 +127,7 @@ You can change the output location via the `--exp` and `--doc` arguments.
 
 ### Step 2 — Physics-informed Reconstruction (Sampling)
 
-Place the trained checkpoint (e.g., `ckpt_Vel_X.pth`) available [here](https://figshare.com/ndownloader/files/63056209?private_link=06434d6d5cfdda10b811) into `./pretrained_weights/` accordingly in `configs/vel_512_1024_conditional.yml`.
+Place the trained checkpoint (e.g., `ckpt_Vel_X.pth`) available [here](https://huggingface.co/datasets/sisi-guevara-ml/data-PIDM/resolve/main/ckpt_Vel_X-Y.pth?download=true) into `./pretrained_weights/` accordingly in `configs/vel_512_1024_conditional.yml`.
 
 From the **root** directory of the repository, run:
 
