@@ -10,7 +10,7 @@ PyTorch implementation of
 
 ## Overview
 
-Denoising Diffusion Probabilistic Models (DDPM) and Denoising Diffusion Implicit Models (DDIM) are used here to train and reconstruct 2D turbulent velocity fields (x- and y-velocity components) for agricultural buildings from sparse data included in guided images. The model is trained CFD numerical solutions and uses a **physics-informed condition** following the continuity equation in order to cover conservation of mass.
+Denoising Diffusion Probabilistic Models (DDPM) and Denoising Diffusion Implicit Models (DDIM) are used here to train and reconstruct 2D turbulent velocity fields (x- and y-velocity components) for agricultural buildings from sparse data included in guided images g(u). The model is trained with CFD numerical solutions as ground truth and incorporates a **physics-informed condition** in the diffusion model to have a Physics Informed Diffusion Model (PIDM) following the continuity equation in order to cover conservation of mass.
 
 <img width="1171" height="243" alt="image1" src="https://github.com/user-attachments/assets/004ffe72-9477-46aa-b5e1-4a9b73d4874e" />
 
