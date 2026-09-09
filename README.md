@@ -10,7 +10,7 @@ PyTorch implementation of
 
 ## Overview
 
-Denoising Diffusion Probabilistic Models (DDPM) are used here to reconstruct high-fidelity 2D turbulent velocity fields (x- and y-components) for agricultural buildings from sparse or low-fidelity references. The model is trained exclusively on high-resolution velocity data and uses a **physics-informed conditioning signal** derived from the k-ε turbulence model to guide the reverse diffusion process. This conditioning considers that change of the velocity field between two consecutive timesteps, comprising RANS (continuity, momentum, and turbulent transport equations) during sampling, could be reconstructed and physically consistent from guided images.
+Denoising Diffusion Probabilistic Models (DDPM) and Denoising Diffusion Implicit Models (DDIM) are used here to train and reconstruct 2D turbulent velocity fields (x- and y-velocity components) for agricultural buildings from sparse data included in guided images. The model is trained CFD numerical solutions and uses a **physics-informed condition** following the continuity equation in order to cover conservation of mass.
 
 <img width="1171" height="243" alt="image1" src="https://github.com/user-attachments/assets/004ffe72-9477-46aa-b5e1-4a9b73d4874e" />
 
@@ -28,7 +28,7 @@ diffusion_final_github/
 │   └── configs/
 │       └── vel_512_1024_conditional.yml          # Training configuration
 ├── runners/
-│   └── rs512_guided_diffusion2.py               # Guided diffusion sampler with k-ε conditioning
+│   └── rs512_guided_diffusion2.py               # Guided diffusion sampler 
 ├── models/
 │   ├── diffusion_new.py                         # UNet (unconditional and conditional variants)
 │   └── ema.py                                   # Exponential Moving Average helper
