@@ -151,6 +151,10 @@ Key sampling arguments:
 
 The `guidance_weight` in the config controls the strength of the k-ε physics residual signal during sampling. Results are saved under `./experiments/` in a subfolder named after the run parameters (e.g., `guided_recons__t1000_r20_w3.0/`).
 
+## Area of interest
+The 2D CFD model considered exterior and interior of the building, however this PIDM model was focused on the building interior as denoted in the image below:
+<img width="1803" height="635" alt="area_of_interest" src="https://github.com/user-attachments/assets/08093140-ccc6-450d-b068-b73d5a141c99" />
+
 
 ## References
 
